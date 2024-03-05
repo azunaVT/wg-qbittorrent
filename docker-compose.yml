@@ -1,0 +1,55 @@
+version: '3.9'
+
+services:
+    wg-qbittorrent:
+      container_name: wg-qbittorrent
+      image: azunaVT/wg-qbittorrent
+      volumes:
+        - pia:/pia
+        - pia-shared:/pia-shared
+        - plexmedia:/data
+        - ./config:/config
+      cap_add:
+        - NET_ADMIN
+        - SYS_MODULE
+      environment:
+          LOC: greenland
+          USER: p8765976
+          PASS: 9SffoF7puX
+          PORT_FORWARDING: 1
+          PUID: ${USERID}
+          PGID: ${USERID}
+      sysctls:
+        - net.ipv4.conf.all.src_valid_mark=1
+        - net.ipv6.conf.default.disable_ipv6=1
+        - net.ipv6.conf.all.disable_ipv6=1
+        - net.ipv6.conf.lo.disable_ipv6=1
+      ports: [8080:8080]
+      healthcheck:
+        test: ping -c 1 www.google.com || exit 1
+        interval: 30s
+        timeout: 10s
+        retries: 3
+
+    wg-rproxy: # SETUP
+      image: nginxproxy/nginx-proxy
+      container_name: rproxy
+      ports:
+        - 80:80
+        - 443:443
+      volumes:
+        - /var/run/docker.sock:/tmp/docker.sock:ro
+        - ./qbittorrent.conf:/etc/nginx/conf.d/qbittorrent.conf
+      environment:
+        HTTPS_METHOD: nohttps
+      restart: unless-stopped
+
+volumes:
+    pia:
+    pia-shared:
+    plexmedia:
+      driver: local
+      driver_opts:
+        type: nfs
+        o: addr=192.168.86.38,nolock,soft,rw
+        device: ":/PLEX"

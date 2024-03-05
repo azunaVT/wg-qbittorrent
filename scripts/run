@@ -1,0 +1,298 @@
+#!/bin/bash
+
+[ -n "$DEBUG" ] && set -o xtrace
+
+# Check and/or set default options
+# Should be 0/1
+[[ "$EXIT_ON_FATAL" =~ ^[0-1]$ ]] || EXIT_ON_FATAL=0
+[[ "$FIREWALL" =~ ^[0-1]$ ]] || FIREWALL=1
+[[ "$PORT_FILE_CLEANUP" =~ ^[0-1]$ ]] || PORT_FILE_CLEANUP=0
+[[ "$PORT_FORWARDING" =~ ^[0-1]$ ]] || PORT_FORWARDING=0
+[[ "$PORT_PERSIST" =~ ^[0-1]$ ]] || PORT_PERSIST=0
+[[ "$PORT_FATAL" =~ ^[0-1]$ ]] || PORT_FATAL=0
+# Should be a positive integer
+[[ "$KEEPALIVE" =~ ^[0-9]+$ ]] || KEEPALIVE=0
+# Maybe also check the following. They are all blank by default.
+# LOCAL_NETWORK=
+# PIA_CN=
+# PIA_IP=
+# PIA_PORT=
+# PORT_FILE=
+# QDISC=
+# VPNDNS=
+# MTU=
+
+configdir="/pia"
+tokenfile="$configdir/.token"
+pf_persistfile="$configdir/portsig.json"
+
+# Run custom scripts at the appropriate time if present
+# We also run custom commands specified by the PRE_UP, POST_UP, PRE_DOWN, and POST_DOWN env vars at the same time
+custom_scriptdir="/pia/scripts"
+pre_up_script="$custom_scriptdir/pre-up.sh"
+post_up_script="$custom_scriptdir/post-up.sh"
+pre_down_script="$custom_scriptdir/pre-down.sh"
+post_down_script="$custom_scriptdir/post-down.sh"
+
+sharedir="/pia-shared"
+# Set env var PORT_FILE to override where the forwarded port number is dumped
+# Might need to handle setting file ownership/permissions too
+portfile="${PORT_FILE:-$sharedir/port.dat}"
+
+pia_cacrt="/rsa_4096.crt"
+wg_conf="/etc/wireguard/wg0.conf"
+
+firewall_init () {
+  echo Blocking default paths in iptables...
+  # Block everything by default
+  ip6tables -P OUTPUT DROP &> /dev/null
+  ip6tables -P INPUT DROP &> /dev/null
+  ip6tables -P FORWARD DROP &> /dev/null
+  iptables -P OUTPUT DROP &> /dev/null
+  iptables -P INPUT DROP &> /dev/null
+  iptables -P FORWARD DROP &> /dev/null
+
+  # Allow loopback traffic and input for established connections
+  iptables -A OUTPUT -o lo -j ACCEPT
+  iptables -A INPUT -i lo -j ACCEPT
+  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  # Temporarily allow DNS queries
+  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+
+  # We also need to temporarily allow the following
+  iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+  iptables -A OUTPUT -p tcp --dport 1337 -j ACCEPT
+}
+
+# Alpine 3.19 changed the default iptables backend to iptables-nft
+# Check that the host supports this and revert to iptables-legacy if needed
+nftables_setup () {
+  # Run an iptables command to see if things are working
+  iptables -L &> /dev/null && return
+  # If not, change to legacy
+  echo "$(date): Falling back to iptables-legacy"
+  ln -sf /sbin/xtables-legacy-multi /sbin/iptables
+  ln -sf /sbin/xtables-legacy-multi /sbin/iptables-save
+  ln -sf /sbin/xtables-legacy-multi /sbin/iptables-restore
+  ln -sf /sbin/xtables-legacy-multi /sbin/ip6tables
+  ln -sf /sbin/xtables-legacy-multi /sbin/ip6tables-save
+  ln -sf /sbin/xtables-legacy-multi /sbin/ip6tables-restore
+}
+
+# Handle shutdown behavior
+finish () {
+  [ -x "$pre_down_script" ] && run_command "$pre_down_script"
+  [ -n "$PRE_DOWN" ] && run_command "$PRE_DOWN"
+  [ $PORT_FORWARDING -eq 1 ] && pkill -f 'pf.sh'
+  echo "$(date): Shutting down WireGuard"
+  # Remove forwarded port number dump file if requested
+  [ $PORT_FILE_CLEANUP -eq 1 ] && [ -w "$portfile" ] && rm "$portfile"
+  wg-quick down wg0
+  [ -x "$post_down_script" ] && run_command "$post_down_script"
+  [ -n "$POST_DOWN" ] && run_command "$POST_DOWN"
+  exit 0
+}
+
+trap finish SIGTERM SIGINT SIGQUIT
+
+# All done. Sleep and wait for termination.
+now_sleep () {
+  if [ $PORT_FORWARDING -eq 1 ] && [ $PORT_FATAL -eq 1 ]; then
+    wait $pf_pid
+    if [ $? -ne 0 ];then
+      echo "$(date): Port forwarding script failed"
+      fatal_error
+    fi
+    echo "$(date): Port forwarding script closed"
+  fi
+  sleep infinity &
+  wait $!
+}
+
+# An error with no recovery logic occured. Either go to sleep or exit.
+fatal_error () {
+  echo "$(date): Fatal error"
+  [ -n "$FATAL_SCRIPT" ] && run_command "$FATAL_SCRIPT"
+  [ $EXIT_ON_FATAL -eq 1 ] && exit 1
+  sleep infinity &
+  wait $!
+}
+
+run_command () {
+  echo "$(date): Running: $1"
+  eval "$1"
+}
+
+gen_wgconf () {
+  /scripts/wg-gen.sh -l "$1" -t "$tokenfile" -o "$wg_conf" -k "/RegionsListPubKey.pem" -d "$VPNDNS" -m "$MTU" -c "$pia_cacrt"
+  return $?
+}
+
+# Get a new auth token
+# Unsure how long an auth token will remain valid
+get_auth_token () {
+  [ -r "$USER_FILE" ] && echo "$(date): Reading username from $USER_FILE" && USER=$(<"$USER_FILE")
+  [ -r "$PASS_FILE" ] && echo "$(date): Reading password from $PASS_FILE" && PASS=$(<"$PASS_FILE")
+  [ -z "$PASS" ] && echo "$(date): PIA password not set. Unable to retrieve new auth token." && fatal_error
+  [ -z "$USER" ] && echo "$(date): PIA username not set. Unable to retrieve new auth token." && fatal_error
+  echo "$(date): Generating auth token"
+  if ! /scripts/pia-auth.sh -u "$USER" -p "$PASS" > "$tokenfile"; then
+    echo "$(date): Failed to acquire new auth token" && fatal_error
+  fi
+  chmod 600 "$tokenfile"
+}
+
+nftables_setup
+
+[ -x "$pre_up_script" ] && run_command "$pre_up_script"
+[ -n "$PRE_UP" ] && run_command "$PRE_UP"
+
+[ $FIREWALL -eq 1 ] && firewall_init
+
+# Remove previous forwarded port number dump file if requested and present
+[ $PORT_FILE_CLEANUP -eq 1 ] && [ -w "$portfile" ] && rm "$portfile"
+
+# LOC is ignored and may be blank if ip/cn/port override vars or a dedicated ip are used
+[ -n "$PIA_CN" ] && [ -n "$PIA_IP" ] && [ -n "$PIA_PORT" ] && LOC="manual"
+[ -n "$PIA_DIP_TOKEN" ] && LOC="dip"
+
+# No LOC or specific ip/port/cn supplied
+echo "LOC: ${LOC}"
+[ -z "$LOC" ] && /scripts/wg-gen.sh -a && fatal_error
+
+[ ! -r "$tokenfile" ] && get_auth_token
+
+# Generate wg0.conf
+# LOC can be a single location id, or a space or comma separated list
+# Multiple location ids are used as fallback if the initial registration fails
+gen_success=0
+for location in ${LOC//,/ }; do
+  gen_wgconf "$location"
+  result=$?
+  if [ "$result" -eq 2 ]; then
+    # Reauth and retry if auth failed
+    # An auth error implies that the location id is valid and the endpoint responsive
+    get_auth_token
+    gen_wgconf "$LOC" || fatal_error
+  elif [ "$result" -eq 3 ]; then
+    # Location not found
+    echo "$(date): Location $location not found"
+    continue
+  elif [ "$result" -eq 4 ]; then
+    # Registration failed
+    echo "$(date): Registration failed"
+    continue
+  elif [ "$result" -ne 0 ]; then
+    echo "$(date): Failed to generate WireGuard config"
+    fatal_error
+  fi
+  gen_success=1
+  break
+done
+
+if [ "$gen_success" -eq 0 ]; then
+  echo "$(date): Failed to generate WireGuard config for the selected location/s: $LOC"
+  fatal_error
+fi
+
+# Add PersistentKeepalive if KEEPALIVE is set
+[ $KEEPALIVE -gt 0 ] && echo "PersistentKeepalive = $KEEPALIVE" >> "$wg_conf"
+
+# Bring up Wireguard interface
+echo "$(date): Bringing up WireGuard interface wg0"
+wg-quick up wg0 || fatal_error
+
+# Print out wg interface info
+echo
+wg
+echo
+
+echo "$(date): WireGuard successfully started"
+
+# Add qdisc to wg0 if requested
+# eg: QDISC=cake bandwidth 20Mbit
+[ -n "$QDISC" ] && echo "$(date): Adding qdisc to wg0: $QDISC" && tc qdisc add root dev wg0 $QDISC && tc -statistics qdisc show dev wg0
+
+if [ $FIREWALL -eq 1 ]; then
+  # Remove temporary rules
+  iptables -D OUTPUT -p udp --dport 53 -j ACCEPT
+  iptables -D OUTPUT -p tcp --dport 443 -j ACCEPT
+  iptables -D OUTPUT -p tcp --dport 1337 -j ACCEPT
+
+  # Allow docker network input/output
+  for iface in /sys/class/net/*; do
+    iface="${iface##*/}"
+    [[ "$iface" = @(lo|wg0) ]] && continue
+    docker_network="$(ip -o addr show dev "$iface"|
+            awk '$3 == "inet" {print $4}')"
+    [ -z "$docker_network" ] &&  continue
+    echo "$(date): Allowing network access to $docker_network on $iface"
+    iptables -A OUTPUT -o "$iface" --destination "$docker_network" -j ACCEPT
+    iptables -A INPUT -i "$iface" --source "$docker_network" -j ACCEPT
+  done
+
+  # Allow WG stuff
+  iptables -A OUTPUT -o wg0 -j ACCEPT
+  iptables -I OUTPUT -m mark --mark "$(wg show wg0 fwmark)" -j ACCEPT
+
+  echo "$(date): Firewall enabled: Blocking non-WireGuard traffic"
+fi
+
+# Set env var LOCAL_NETWORK=192.168.1.0/24 to allow LAN input/output
+# Accept comma separated as well as space separated list
+if [ -n "$LOCAL_NETWORK" ]; then
+  iface=$(ip route show default | awk '/default/ {print $5}')
+  gaddr=$(ip route show default | awk '/default/ {print $3}')
+  for range in ${LOCAL_NETWORK//,/ }; do
+    if [ $FIREWALL -eq 1 ]; then
+      echo "$(date): Allowing network access to $range on $iface"
+      iptables -A OUTPUT -o "$iface" --destination "$range" -j ACCEPT
+      iptables -A INPUT -i "$iface" --source "$range" -j ACCEPT
+    fi
+    echo "$(date): Adding route to $range"
+    ip route add "$range" via "$gaddr"
+  done
+fi
+
+# Nat+forward traffic from a specific interface if requested
+# eg. FWD_IFACE=eth1
+if [ -n "$FWD_IFACE" ]; then
+  iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+  iptables -A FORWARD -i wg0 -o "$FWD_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  iptables -A FORWARD -i "$FWD_IFACE" -o wg0 -j ACCEPT
+  echo "$(date): Forwarding traffic from $FWD_IFACE to VPN"
+fi
+
+# Setup port forwarding if requested and available
+pf_api_ip=$(grep '#pf api' "$wg_conf"| sed 's/#pf api ip: \(.*\)/\1/')
+pf_cn=$(grep '#cn: ' "$wg_conf"| sed 's/#cn: \(.*\)/\1/')
+if [ $PORT_FORWARDING -eq 1 ] && [ -n "$pf_api_ip" ]; then
+  echo "$(date): Starting port forward script"
+  # Try to use a persistent port if requested
+  if [ $PORT_PERSIST -eq 1 ]; then
+    /scripts/pf.sh -t "$tokenfile" -i "$pf_api_ip" -n "$pf_cn" -p "$portfile" -c "$pia_cacrt" -s "/scripts/pf_success.sh" -r "$pf_persistfile" -f wg0 &
+  else
+    /scripts/pf.sh -t "$tokenfile" -i "$pf_api_ip" -n "$pf_cn" -p "$portfile" -c "$pia_cacrt" -s "/scripts/pf_success.sh" -f wg0 &
+  fi
+  pf_pid=$!
+fi
+
+[ -x "$post_up_script" ] && run_command "$post_up_script"
+[ -n "$POST_UP" ] && run_command "$POST_UP"
+
+# Workaround a NAT bug when using Wireguard behind a particular Asus router by regularly changing the local port
+# Set env var CYCLE_PORTS to a space-separated list of ports to cycle through
+# Eg: CYCLE_PORTS=50001 50002 50003
+# Optionally set CYCLE_INTERVAL to number of seconds to use each port for. Defaults to 180 (3mins)
+if [ -n "$CYCLE_PORTS" ]; then
+  echo "$(date): Changing Wireguard's local port every ${CYCLE_INTERVAL:-180}s"
+  while true; do
+    for port in $CYCLE_PORTS; do
+      wg set wg0 listen-port "$port"
+      sleep "${CYCLE_INTERVAL:-180}" & wait $!
+    done
+  done
+fi
+
+now_sleep

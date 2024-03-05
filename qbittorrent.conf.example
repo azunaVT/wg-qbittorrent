@@ -1,0 +1,42 @@
+upstream [your-server-name] {
+    server wg-qbittorrent:8080;
+}
+
+server {
+    server_name [your-server-name];
+    access_log /var/log/nginx/access.log vhost;
+    http2 on;
+    listen 80;
+
+    location / {
+        proxy_pass       http://wg-qbittorrent:8080/;
+
+        proxy_set_header Host wg-qbittorrent:8080;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        #proxy_set_header Range $http_range;
+        #proxy_set_header If-Range $http_if_range;
+        #proxy_set_header X-Forwarded-Proto $scheme;
+        #proxy_set_header X-Real-IP $remote_addr;
+        # Mitigate httpoxy attack (see README for details)
+        #proxy_set_header Proxy "";
+        #add_header Referrer-Policy "no-referrer";
+
+	# Use this option if we're using listen 443 ssl in the nginx proxy.
+	# If both are unsecured, we should leave this commented for now.
+        #proxy_cookie_path / "/;";
+        #proxy_cookie_path / "/; Secure";
+
+
+        ## Required for websockets
+        proxy_http_version 1.1;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        ## Optional: Do not log, get it at the destination
+        access_log off;
+    }
+}
