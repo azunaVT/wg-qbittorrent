@@ -1,0 +1,8 @@
+## Logging:
+##   Levels = critical error warn notice info debug
+log.execute = (cat, (cfg.logs), "execute.log")
+log.xmlrpc = (cat, (cfg.logs), "xmlrpc.log")
+
+print = (cat, "Logging to ", (cfg.logfile))
+log.open_file = "log", (cfg.logfile)
+log.add_output = "info", "log"

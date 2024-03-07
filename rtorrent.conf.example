@@ -1,9 +1,9 @@
-upstream [your-server-name] {
-    server wg-qbittorrent:8080;
+upstream  {
+    server wg-rtorrent:5000;
 }
 
 server {
-    server_name [your-server-name];
+    server_name ;
     access_log /var/log/nginx/access.log vhost;
     http2 on;
     listen 80;

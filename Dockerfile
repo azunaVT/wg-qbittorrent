@@ -1,13 +1,15 @@
-FROM lscr.io/linuxserver/qbittorrent:libtorrentv1 as qBittorrent
+FROM ghcr.io/linuxserver/baseimage-alpine:edge
 
 RUN apk add --no-cache \
 	bash \
-    	ca-certificates \
+   	ca-certificates \
 	curl \
 	iptables \
 	jq \
 	openssl \
-	wireguard-tools
+	wireguard-tools \
+    rtorrent \
+    nginx
 
 # Modify wg-quick so it doesn't die without --privileged
 # Set net.ipv4.conf.all.src_valid_mark=1 on container creation using --sysctl if required instead
@@ -21,6 +23,12 @@ RUN apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/t
 # Replacing with a newer version (currently 1.24) from the edge repo appears to fix it
 # This is only a temporary fix, and can be removed once the newer version makes its way into Alpine 3.19
 #RUN apk upgrade --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main c-ares
+
+# Copy rtorrent files
+COPY defaults/rtorrent.rc /config/
+COPY defaults/nginx.conf /config/
+COPY defaults/config.d /config/config.d/
+RUN chown -R abc:abc /config
 
 # Get the PIA CA cert
 ADD https://raw.githubusercontent.com/pia-foss/desktop/master/daemon/res/ca/rsa_4096.crt /rsa_4096.crt
